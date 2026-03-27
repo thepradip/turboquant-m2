@@ -1,8 +1,8 @@
 # TurboQuant
 
-KV-cache compression for LLM inference on Apple Silicon using MLX.
+KV-cache compression for LLM inference on Apple Silicon (MLX).
 
-Based on: [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) — Google Research, ICLR 2026
+Based on: [TurboQuant (Google Research, ICLR 2026)](https://arxiv.org/abs/2504.19874)
 
 ## Install
 
@@ -17,82 +17,64 @@ pip install git+https://github.com/thepradip/turboquant-m2.git
 import mlx_lm
 import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
-from turboquant import compress_kv_cache_mlx
+from turboquant import compress_cache
 
-# Load any HuggingFace model via MLX
-model, tokenizer = mlx_lm.load("mlx-community/Qwen3.5-2B-4bit")
+# Load any HuggingFace model
+model, tok = mlx_lm.load("Qwen/Qwen2.5-1.5B-Instruct")
 
-# Tokenize and prefill
-text = tokenizer.apply_chat_template(
+# Prefill
+text = tok.apply_chat_template(
     [{"role": "user", "content": "Your prompt here"}],
     tokenize=False, add_generation_prompt=True
 )
-ids = mx.array(tokenizer.encode(text))
+ids = mx.array(tok.encode(text))
 cache = make_prompt_cache(model)
 logits = model(ids[None], cache=cache)
 mx.eval(logits)
 
-# Compress KV cache — auto-detects model config
-result = compress_kv_cache_mlx(cache, model=model)
+# Compress KV cache — one line, auto-detects everything
+result = compress_cache(cache, model=model, bits=4)
 print(result)
-# {'cosine': 0.9953, 'compress_ms': 1620, 'layers_compressed': 6,
-#  'original_mb': 24.3, 'compressed_mb': 6.2, 'saved_mb': 18.1, 'ratio': 3.9}
 
-# Continue generation with compressed cache
+# Generate with compressed cache
 y = mx.argmax(logits[:, -1, :], axis=-1)
 tokens = []
 for _ in range(200):
     logits = model(y.reshape(1, -1), cache=cache)
     mx.eval(logits)
     y = mx.argmax(logits[:, -1, :], axis=-1)
-    if y.item() == tokenizer.eos_token_id:
+    if y.item() == tok.eos_token_id:
         break
     tokens.append(y.item())
-
-print(tokenizer.decode(tokens))
+print(tok.decode(tokens))
 ```
 
-## Low-level API
+## Status
 
-```python
-from turboquant import TurboQuantMLX
+Tested on M2 Pro 16GB with Qwen2.5-1.5B-Instruct (28 layers, head_dim=128):
 
-tq = TurboQuantMLX(bits=4, head_dim=128)
-compressed = tq.compress(kv_tensor)   # MLX array in
-reconstructed = tq.decompress(compressed)  # MLX array out
-print(tq.memory_bytes(compressed))
+| Test | FP16 baseline | TurboQuant 4-bit | Result |
+|------|:---:|:---:|:---:|
+| "What is 2+2?" | "4" | "4" | PASS |
+| Attention formula | Correct | Correct (minor grammar) | PASS |
+| TCP vs UDP | 3 correct points | 3 correct points | PASS |
+| Code generation | Correct function | Starts OK, then degrades | PARTIAL |
+
+**What works**: Factual QA, reasoning, short answers, topic identification.
+
+**What doesn't work reliably**: Long code generation, complex multi-step outputs. The MSE quantization introduces bias that accumulates over long generation.
+
+**Next step**: QJL residual correction (Stage 2 of TurboQuant paper) to remove inner product bias. Code is written (`qjl.py`, `attention.py`, `cache.py`) but attention integration needs debugging.
+
+## Architecture
+
 ```
-
-## Auto-detect model config
-
-```python
-from turboquant import get_model_config
-
-config = get_model_config(model)
-# {'head_dim': 256, 'num_layers': 24, 'num_kv_heads': 2, ...}
+src/turboquant/
+├── __init__.py       # compress_cache, get_model_config
+├── patch.py          # compress_cache() — compress KV in-place
+├── compressor.py     # Stage 1: PolarQuant (rotation + Lloyd-Max)
+├── codebook.py       # Lloyd-Max codebook builder
+├── qjl.py           # Stage 2: QJL residual correction (written, not integrated)
+├── attention.py      # Custom attention with QJL (written, not integrated)
+└── cache.py          # TurboQuant cache structure (written, not integrated)
 ```
-
-## Tested models
-
-| Model | head_dim | Layers compressed | Cosine | Status |
-|-------|:---:|:---:|:---:|:---:|
-| mlx-community/Qwen3.5-2B-4bit | 256 | 6/24 (full attn only) | 0.9953 | Works |
-| Qwen/Qwen2.5-1.5B-Instruct | 128 | 28/28 | 0.9959 | Compression works, generation degrades |
-| Qwen/Qwen2.5-0.5B-Instruct | 64 | 24/24 | 0.9955 | Not recommended (head_dim too small) |
-
-## Known limitations
-
-- **Generation quality**: Compressing all layers degrades output on standard models (Qwen2.5, Llama). Works best on hybrid models (Qwen3.5) where only full-attention layers are compressed.
-- **Apple Silicon only**: Uses MLX. Does not work on CUDA/CPU-only machines.
-- **Metal buffer limit**: Contexts above ~24K tokens may hit Metal's 8GB single-allocation limit.
-- **One-time overhead**: Codebook initialization takes 1-5s per request depending on context length.
-
-## How it works
-
-1. Record vector norm
-2. Normalize to unit sphere
-3. Apply random orthogonal rotation (fixed per layer)
-4. After rotation, coordinates follow known Beta distribution
-5. Apply Lloyd-Max optimal scalar quantizer (precomputed centroids)
-6. Store: 4-bit indices + FP16 norm per token
-7. Dequantize: lookup centroids, inverse rotation, rescale by norm

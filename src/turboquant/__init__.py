@@ -1,3 +1,5 @@
-"""TurboQuant — KV-cache compression for MLX on Apple Silicon."""
-__version__ = "0.3.0"
-from .mlx_native import TurboQuantMLX, compress_kv_cache_mlx, get_model_config
+"""TurboQuant — KV-cache compression for LLM inference on Apple Silicon."""
+__version__ = "0.4.0"
+
+from .patch import compress_cache, get_head_dim, get_num_layers, get_model_config
+from .compressor import PolarQuantMLX

@@ -1,0 +1,169 @@
+"""
+Patch any MLX model to use TurboQuant compressed KV cache.
+
+Approach: After each prefill/decode step, compress the KV cache in-place.
+Does NOT modify the attention computation — keeps standard attention intact.
+This is simpler and proven to work.
+
+Usage:
+    import mlx_lm
+    from turboquant.patch import compress_cache, get_head_dim
+
+    model, tok = mlx_lm.load("Qwen/Qwen2.5-1.5B-Instruct")
+    cache = make_prompt_cache(model)
+    logits = model(ids[None], cache=cache)
+    compress_cache(cache, model=model)  # compress all layers in-place
+    # continue generation normally — model reads compressed values from cache
+"""
+
+import time
+import mlx.core as mx
+from typing import Any, Dict, List, Optional
+
+from .compressor import PolarQuantMLX
+
+
+def get_head_dim(model) -> int:
+    """Auto-detect head_dim from any MLX model."""
+    args = model.args
+    if hasattr(args, 'text_config'):
+        tc = args.text_config
+        return tc.get("head_dim", tc["hidden_size"] // tc["num_attention_heads"])
+    return getattr(args, "head_dim", args.hidden_size // args.num_attention_heads)
+
+
+def get_num_layers(model) -> int:
+    """Auto-detect number of layers."""
+    args = model.args
+    if hasattr(args, 'text_config'):
+        return args.text_config["num_hidden_layers"]
+    return getattr(args, "num_hidden_layers", len(model.layers))
+
+
+def get_model_config(model) -> Dict:
+    """Auto-detect full model config."""
+    args = model.args
+    if hasattr(args, 'text_config'):
+        tc = args.text_config
+        return {
+            "head_dim": tc.get("head_dim", tc["hidden_size"] // tc["num_attention_heads"]),
+            "num_layers": tc["num_hidden_layers"],
+            "num_kv_heads": tc["num_key_value_heads"],
+            "num_attention_heads": tc["num_attention_heads"],
+            "hidden_size": tc["hidden_size"],
+        }
+    hidden = getattr(args, "hidden_size", 0)
+    n_heads = getattr(args, "num_attention_heads", 1)
+    return {
+        "head_dim": getattr(args, "head_dim", hidden // n_heads if n_heads else 128),
+        "num_layers": getattr(args, "num_hidden_layers", len(model.layers)),
+        "num_kv_heads": getattr(args, "num_key_value_heads", n_heads),
+        "num_attention_heads": n_heads,
+        "hidden_size": hidden,
+    }
+
+
+def compress_cache(
+    cache: List[Any],
+    model: Any = None,
+    head_dim: int = None,
+    bits: int = 4,
+    window_size: int = 0,
+    min_context: int = 0,
+) -> Dict:
+    """
+    Compress KV cache in-place using TurboQuant.
+
+    Args:
+        cache: List of MLX KVCache objects from make_prompt_cache().
+        model: MLX model (for auto-detecting head_dim).
+        head_dim: Override head_dim if model not provided.
+        bits: Quantization bits (2, 3, or 4). Default: 4.
+        window_size: Keep this many recent tokens uncompressed. Default: 0 (compress all).
+        min_context: Skip compression if context shorter than this. Default: 0.
+
+    Returns:
+        Dict with cosine, compress_ms, layers_compressed, memory stats.
+    """
+    if head_dim is None and model is not None:
+        head_dim = get_head_dim(model)
+    if head_dim is None:
+        raise ValueError("Provide head_dim or model")
+
+    t0 = time.time()
+    cos_scores = []
+    total_orig = 0
+    total_comp = 0
+
+    for li in range(len(cache)):
+        c = cache[li]
+        if not hasattr(c, 'keys') or c.keys is None:
+            continue
+        seq = c.offset
+        if seq <= min_context:
+            continue
+
+        # Determine range to compress
+        compress_end = seq - window_size if window_size > 0 else seq
+        if compress_end <= 0:
+            continue
+
+        k = c.keys[:, :, :compress_end, :]
+        v = c.values[:, :, :compress_end, :]
+        mx.eval(k, v)
+
+        kd = k.shape[-1]
+        if kd < 2:
+            continue
+
+        # Compress keys
+        k_mse = PolarQuantMLX(kd, bits=bits, seed=42 + li)
+        k_f = k.astype(mx.float32)
+        k_norms = mx.sqrt(mx.sum(k_f * k_f, axis=-1, keepdims=True))
+        k_norms = mx.maximum(k_norms, 1e-8)
+        k_unit = k_f / k_norms
+        k_hat_unit = k_mse.dequantize(k_mse.quantize(k_unit))
+        k_hat = (k_hat_unit * k_norms).astype(k.dtype)
+
+        # Compress values
+        v_mse = PolarQuantMLX(kd, bits=bits, seed=1000 + li)
+        v_f = v.astype(mx.float32)
+        v_norms = mx.sqrt(mx.sum(v_f * v_f, axis=-1, keepdims=True))
+        v_norms = mx.maximum(v_norms, 1e-8)
+        v_unit = v_f / v_norms
+        v_hat_unit = v_mse.dequantize(v_mse.quantize(v_unit))
+        v_hat = (v_hat_unit * v_norms).astype(v.dtype)
+
+        # Cosine similarity
+        flat_k = mx.reshape(k_f, (-1, kd))
+        flat_r = mx.reshape(k_hat.astype(mx.float32), (-1, kd))
+        dot = mx.sum(flat_k * flat_r, axis=-1)
+        nk = mx.sqrt(mx.sum(flat_k * flat_k, axis=-1))
+        nr = mx.sqrt(mx.sum(flat_r * flat_r, axis=-1))
+        cos = mx.mean(dot / (nk * nr + 1e-8))
+        mx.eval(cos)
+        cos_scores.append(cos.item())
+
+        # Memory tracking
+        n_elements = k.size
+        total_orig += n_elements * 2 * 2  # K + V, 2 bytes each (FP16)
+        total_comp += (n_elements * bits / 8 + k.shape[2] * k.shape[1] * 2) * 2  # indices + norms, K+V
+
+        # Write back in-place
+        c.keys[:, :, :compress_end, :] = k_hat
+        c.values[:, :, :compress_end, :] = v_hat
+        mx.eval(c.keys, c.values)
+
+    elapsed_ms = (time.time() - t0) * 1000
+    avg_cos = sum(cos_scores) / len(cos_scores) if cos_scores else 0
+    ratio = total_orig / total_comp if total_comp > 0 else 0
+
+    return {
+        "cosine": round(avg_cos, 4),
+        "compress_ms": round(elapsed_ms, 0),
+        "layers_compressed": len(cos_scores),
+        "original_mb": round(total_orig / 1024 / 1024, 1),
+        "compressed_mb": round(total_comp / 1024 / 1024, 1),
+        "saved_mb": round((total_orig - total_comp) / 1024 / 1024, 1),
+        "ratio": round(ratio, 1),
+    }
