@@ -1,129 +1,102 @@
 """
-TurboQuant KV Cache — stores compressed keys (MSE + QJL) and values (MSE only).
+TurboQuant KV Cache — stores compressed keys with QJL correction data.
 
-Drop-in compatible with MLX's KVCache interface.
-Keys use TurboQuantProd (MSE + QJL) because attention needs unbiased inner products.
-Values use PolarQuant MSE only because they're used for weighted sum, not inner products.
+Keys: MSE indices + QJL signs + residual norms + vector norms
+Values: MSE dequantized (values tolerate MSE-only, no QJL needed)
+
+The cache returns MSE-dequantized tensors for standard attention,
+plus QJL data that the patched attention uses for bias correction.
 """
 
 import mlx.core as mx
 from .compressor import PolarQuantMLX
 from .qjl import QJLMLX
-from .codebook import build_codebook, build_rotation
 
 
 class TurboQuantCache:
     """
-    Compressed KV cache for one transformer layer.
+    Drop-in KVCache replacement that compresses on insert.
 
-    Stores:
-      Keys:   MSE indices (uint8) + QJL signs (packed uint8) + residual norms (fp16) + vector norms (fp16)
-      Values: MSE indices (uint8) + vector norms (fp16)
-
-    On update_and_fetch:
-      - Compresses new K,V tokens
-      - Returns (keys_for_attention, values_for_attention) where:
-        - keys include metadata needed for QJL-corrected attention
-        - values are MSE-dequantized
-
-    The attention function must use turboquant_attention() instead of standard Q@K^T.
+    Shapes match MLX's KVCache exactly:
+      keys/values: (batch, n_kv_heads, seq_len, head_dim)
     """
 
-    # MLX checks for this
-    step = 256
+    step = 256  # MLX checks this
 
     def __init__(self, head_dim: int, key_bits: int = 4, value_bits: int = 4,
                  layer_idx: int = 0):
         self.head_dim = head_dim
-        self.key_bits = key_bits
-        self.value_bits = value_bits
         self.layer_idx = layer_idx
 
-        # Key compressor: (bits-1) for MSE, 1 for QJL
-        mse_bits = max(key_bits - 1, 1)
-        self.key_mse = PolarQuantMLX(head_dim, mse_bits, seed=42 + layer_idx)
+        # Full bits for MSE — quality over compression
+        self.key_mse = PolarQuantMLX(head_dim, key_bits, seed=42 + layer_idx)
         self.key_qjl = QJLMLX(head_dim, seed=43 + layer_idx)
-
-        # Value compressor: full bits for MSE (no QJL needed for values)
         self.val_mse = PolarQuantMLX(head_dim, value_bits, seed=1000 + layer_idx)
 
-        # Stored compressed data
-        self.key_indices = None      # uint8, (..., head_dim)
-        self.key_signs = None        # float32, (..., m) — unpacked for fast attention
-        self.key_residual_norms = None  # fp16, (...,)
-        self.key_norms = None        # fp16, (...,)
-        self.val_indices = None      # uint8, (..., head_dim)
-        self.val_norms = None        # fp16, (...,)
+        # Dequantized keys/values (what the model sees)
+        self.keys = None
+        self.values = None
         self.offset = 0
+
+        # QJL correction data (used by patched attention)
+        self.qjl_signs = None       # (B, n_kv, seq, m) float32 ±1
+        self.qjl_res_norms = None   # (B, n_kv, seq) float16
+        self.qjl_key_norms = None   # (B, n_kv, seq) float16
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """
-        Compress new K,V and append to cache.
+        Compress new K,V and return dequantized versions.
+        Also stores QJL correction data for attention.
 
         Args:
-            keys: (batch, n_kv_heads, new_seq, head_dim)
-            values: (batch, n_kv_heads, new_seq, head_dim)
+            keys: (B, n_kv_heads, new_seq, head_dim) — after RoPE
+            values: (B, n_kv_heads, new_seq, head_dim)
 
         Returns:
-            Tuple of:
-              - self (cache reference, attention function reads compressed data directly)
-              - dequantized values for attention output aggregation
+            (dequantized_keys, dequantized_values) — same shapes as input cache
         """
-        k_float = keys.astype(mx.float32)
-        v_float = values.astype(mx.float32)
+        k_f = keys.astype(mx.float32)
+        v_f = values.astype(mx.float32)
 
-        # Key norms
-        k_norms = mx.sqrt(mx.sum(k_float * k_float, axis=-1))
-        k_norms_safe = mx.maximum(k_norms, 1e-8)
-        k_normalized = k_float / mx.expand_dims(k_norms_safe, axis=-1)
+        # Key norms + normalize
+        k_norms = mx.sqrt(mx.sum(k_f * k_f, axis=-1, keepdims=True))
+        k_norms = mx.maximum(k_norms, 1e-8)
+        k_unit = k_f / k_norms
 
-        # Key Stage 1: MSE quantize on unit sphere
-        k_indices, k_residual = self.key_mse.quantize_with_residual(k_normalized)
+        # Key MSE quantize on unit sphere + get residual
+        k_indices, k_residual = self.key_mse.quantize_with_residual(k_unit)
+        k_hat_unit = self.key_mse.dequantize(k_indices)
 
-        # Key Stage 2: QJL on residual
+        # Key QJL on residual
         k_signs, k_res_norms = self.key_qjl.compute_signs(k_residual)
 
-        # Value: MSE quantize (full precision, no QJL)
-        v_norms = mx.sqrt(mx.sum(v_float * v_float, axis=-1))
-        v_norms_safe = mx.maximum(v_norms, 1e-8)
-        v_normalized = v_float / mx.expand_dims(v_norms_safe, axis=-1)
-        v_indices = self.val_mse.quantize(v_normalized)
+        # Key dequantize: rescale by norms
+        k_deq = (k_hat_unit * k_norms).astype(keys.dtype)
 
-        # Append to stored cache
-        if self.key_indices is None:
-            self.key_indices = k_indices
-            self.key_signs = k_signs
-            self.key_residual_norms = k_res_norms
-            self.key_norms = k_norms.astype(mx.float16)
-            self.val_indices = v_indices
-            self.val_norms = v_norms.astype(mx.float16)
+        # Value: MSE quantize + dequantize
+        v_norms = mx.sqrt(mx.sum(v_f * v_f, axis=-1, keepdims=True))
+        v_norms = mx.maximum(v_norms, 1e-8)
+        v_unit = v_f / v_norms
+        v_hat_unit = self.val_mse.dequantize(self.val_mse.quantize(v_unit))
+        v_deq = (v_hat_unit * v_norms).astype(values.dtype)
+
+        # Append to storage
+        k_norms_sq = k_norms.squeeze(-1).astype(mx.float16)
+        if self.keys is None:
+            self.keys = k_deq
+            self.values = v_deq
+            self.qjl_signs = k_signs
+            self.qjl_res_norms = k_res_norms
+            self.qjl_key_norms = k_norms_sq
         else:
-            self.key_indices = mx.concatenate([self.key_indices, k_indices], axis=2)
-            self.key_signs = mx.concatenate([self.key_signs, k_signs], axis=2)
-            self.key_residual_norms = mx.concatenate([self.key_residual_norms, k_res_norms], axis=2)
-            self.key_norms = mx.concatenate([self.key_norms, k_norms.astype(mx.float16)], axis=2)
-            self.val_indices = mx.concatenate([self.val_indices, v_indices], axis=2)
-            self.val_norms = mx.concatenate([self.val_norms, v_norms.astype(mx.float16)], axis=2)
+            self.keys = mx.concatenate([self.keys, k_deq], axis=2)
+            self.values = mx.concatenate([self.values, v_deq], axis=2)
+            self.qjl_signs = mx.concatenate([self.qjl_signs, k_signs], axis=2)
+            self.qjl_res_norms = mx.concatenate([self.qjl_res_norms, k_res_norms], axis=2)
+            self.qjl_key_norms = mx.concatenate([self.qjl_key_norms, k_norms_sq], axis=2)
 
         self.offset += keys.shape[2]
-
-        # Return dequantized keys and values for the attention function
-        # Keys: dequantize MSE part + rescale (attention function adds QJL correction)
-        k_mse = self.key_mse.dequantize(self.key_indices)
-        k_mse = k_mse * mx.expand_dims(self.key_norms.astype(mx.float32), axis=-1)
-
-        v_mse = self.val_mse.dequantize(self.val_indices)
-        v_mse = v_mse * mx.expand_dims(self.val_norms.astype(mx.float32), axis=-1)
-
-        return k_mse.astype(keys.dtype), v_mse.astype(values.dtype)
-
-    def get_qjl_data(self):
-        """Return QJL data needed for attention correction."""
-        return {
-            "signs": self.key_signs,
-            "residual_norms": self.key_residual_norms,
-            "key_norms": self.key_norms,
-        }
+        return self.keys, self.values
 
     def size(self):
         return self.offset
@@ -134,10 +107,12 @@ class TurboQuantCache:
 
     @property
     def state(self):
-        return self.key_indices, self.val_indices
+        if self.keys is None:
+            return None, None
+        return self.keys, self.values
 
     def is_trimmable(self):
         return False
 
     def empty(self):
-        return self.key_indices is None
+        return self.keys is None

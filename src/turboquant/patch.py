@@ -1,24 +1,22 @@
 """
 Patch any MLX model to use TurboQuant compressed KV cache.
 
-Approach: After each prefill/decode step, compress the KV cache in-place.
-Does NOT modify the attention computation — keeps standard attention intact.
-This is simpler and proven to work.
+Two modes:
+  1. compress_cache() — compress in-place after prefill (simple, works well)
+  2. patch_model() — replace attention with QJL-corrected version (full algorithm)
 
-Usage:
-    import mlx_lm
-    from turboquant.patch import compress_cache, get_head_dim
+Usage (simple):
+    compress_cache(cache, model=model)
 
-    model, tok = mlx_lm.load("Qwen/Qwen2.5-1.5B-Instruct")
-    cache = make_prompt_cache(model)
-    logits = model(ids[None], cache=cache)
-    compress_cache(cache, model=model)  # compress all layers in-place
-    # continue generation normally — model reads compressed values from cache
+Usage (full QJL):
+    patch_model(model, bits=4)
+    cache = make_turboquant_cache(model, bits=4)
+    logits = model(ids[None], cache=cache)  # uses QJL-corrected attention
 """
 
 import time
 import mlx.core as mx
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .compressor import PolarQuantMLX
 
@@ -167,3 +165,92 @@ def compress_cache(
         "saved_mb": round((total_orig - total_comp) / 1024 / 1024, 1),
         "ratio": round(ratio, 1),
     }
+
+
+# ═══════════════════════════════════════════════════════
+#  Full QJL Integration — patch model attention
+# ═══════════════════════════════════════════════════════
+
+def make_turboquant_cache(model, bits: int = 4, value_bits: int = None) -> List:
+    """Create TurboQuant caches for all KVCache layers, default for others."""
+    from mlx_lm.models.cache import make_prompt_cache, KVCache
+    from .cache import TurboQuantCache
+
+    head_dim = get_head_dim(model)
+    vb = value_bits or bits
+    default = make_prompt_cache(model)
+
+    caches = []
+    for i in range(len(default)):
+        if isinstance(default[i], KVCache):
+            caches.append(TurboQuantCache(head_dim, key_bits=bits, value_bits=vb, layer_idx=i))
+        else:
+            caches.append(default[i])
+    return caches
+
+
+def patch_model(model, bits: int = 4):
+    """
+    Monkey-patch model attention to use QJL-corrected scores with TurboQuantCache.
+
+    After patching, use make_turboquant_cache() to create the cache, then
+    model(ids, cache=cache) automatically compresses KV and applies QJL correction.
+    """
+    import types
+    from .cache import TurboQuantCache
+    from .attention import turboquant_sdpa
+
+    head_dim = get_head_dim(model)
+    patched = 0
+
+    for i, layer in enumerate(model.layers):
+        attn = None
+        for name in ['self_attn', 'attention', 'attn']:
+            if hasattr(layer, name):
+                attn = getattr(layer, name)
+                break
+        if attn is None or not hasattr(attn, 'q_proj'):
+            continue
+
+        def make_patched(original_attn):
+            def patched_call(self, x, mask=None, cache=None):
+                B, L, D = x.shape
+                queries = self.q_proj(x)
+                keys = self.k_proj(x)
+                values = self.v_proj(x)
+
+                queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+                keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+                values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+                if cache is not None:
+                    queries = self.rope(queries, offset=cache.offset)
+                    keys = self.rope(keys, offset=cache.offset)
+                    keys, values = cache.update_and_fetch(keys, values)
+
+                    if isinstance(cache, TurboQuantCache):
+                        output = turboquant_sdpa(
+                            queries, keys, values,
+                            cache=cache, scale=self.scale, mask=mask,
+                        )
+                    else:
+                        from mlx_lm.models.base import scaled_dot_product_attention
+                        output = scaled_dot_product_attention(
+                            queries, keys, values, cache=cache, scale=self.scale, mask=mask,
+                        )
+                else:
+                    queries = self.rope(queries)
+                    keys = self.rope(keys)
+                    from mlx_lm.models.base import scaled_dot_product_attention
+                    output = scaled_dot_product_attention(
+                        queries, keys, values, scale=self.scale, mask=mask,
+                    )
+
+                output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                return self.o_proj(output)
+            return patched_call
+
+        attn.__call__ = types.MethodType(make_patched(attn), attn)
+        patched += 1
+
+    return patched
