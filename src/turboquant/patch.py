@@ -138,46 +138,46 @@ def compress_cache(
     total_orig = 0
     total_comp = 0
 
+    # Pre-build all compressors (codebook cached, rotation cached)
+    compressors = {}
     for li in range(len(cache)):
         c = cache[li]
         if not hasattr(c, 'keys') or c.keys is None:
             continue
+        kd = c.keys.shape[-1]
+        if kd < 2:
+            continue
+        compressors[li] = (
+            PolarQuantMLX(kd, bits=bits, seed=42 + li),
+            PolarQuantMLX(kd, bits=bits, seed=1000 + li),
+        )
+
+    for li, (k_mse, v_mse) in compressors.items():
+        c = cache[li]
         seq = c.offset
         if seq <= min_context:
             continue
 
-        # Determine range to compress
         compress_end = seq - window_size if window_size > 0 else seq
         if compress_end <= 0:
             continue
 
         k = c.keys[:, :, :compress_end, :]
         v = c.values[:, :, :compress_end, :]
-        mx.eval(k, v)
 
         kd = k.shape[-1]
-        if kd < 2:
-            continue
 
-        # Compress keys
-        k_mse = PolarQuantMLX(kd, bits=bits, seed=42 + li)
+        # Compress keys: normalize → quantize → dequantize → rescale
         k_f = k.astype(mx.float32)
-        k_norms = mx.sqrt(mx.sum(k_f * k_f, axis=-1, keepdims=True))
-        k_norms = mx.maximum(k_norms, 1e-8)
-        k_unit = k_f / k_norms
-        k_hat_unit = k_mse.dequantize(k_mse.quantize(k_unit))
-        k_hat = (k_hat_unit * k_norms).astype(k.dtype)
+        k_norms = mx.maximum(mx.sqrt(mx.sum(k_f * k_f, axis=-1, keepdims=True)), 1e-8)
+        k_hat = (k_mse.dequantize(k_mse.quantize(k_f / k_norms)) * k_norms).astype(k.dtype)
 
         # Compress values
-        v_mse = PolarQuantMLX(kd, bits=bits, seed=1000 + li)
         v_f = v.astype(mx.float32)
-        v_norms = mx.sqrt(mx.sum(v_f * v_f, axis=-1, keepdims=True))
-        v_norms = mx.maximum(v_norms, 1e-8)
-        v_unit = v_f / v_norms
-        v_hat_unit = v_mse.dequantize(v_mse.quantize(v_unit))
-        v_hat = (v_hat_unit * v_norms).astype(v.dtype)
+        v_norms = mx.maximum(mx.sqrt(mx.sum(v_f * v_f, axis=-1, keepdims=True)), 1e-8)
+        v_hat = (v_mse.dequantize(v_mse.quantize(v_f / v_norms)) * v_norms).astype(v.dtype)
 
-        # Cosine similarity
+        # Cosine similarity — computed before write-back while originals are available
         flat_k = mx.reshape(k_f, (-1, kd))
         flat_r = mx.reshape(k_hat.astype(mx.float32), (-1, kd))
         dot = mx.sum(flat_k * flat_r, axis=-1)
@@ -192,10 +192,18 @@ def compress_cache(
         total_orig += n_elements * 2 * 2  # K + V, 2 bytes each (FP16)
         total_comp += (n_elements * bits / 8 + k.shape[2] * k.shape[1] * 2) * 2  # indices + norms, K+V
 
-        # Write back in-place
+        # Write back (defer eval to batch)
         c.keys[:, :, :compress_end, :] = k_hat
         c.values[:, :, :compress_end, :] = v_hat
-        mx.eval(c.keys, c.values)
+
+    # Batch eval all layers at once
+    to_eval = []
+    for li in compressors:
+        c = cache[li]
+        if c.keys is not None:
+            to_eval.extend([c.keys, c.values])
+    if to_eval:
+        mx.eval(*to_eval)
 
     elapsed_ms = (time.time() - t0) * 1000
     avg_cos = sum(cos_scores) / len(cos_scores) if cos_scores else 0

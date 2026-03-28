@@ -10,6 +10,7 @@ from .patch import (
     get_num_layers,
     get_model_config,
 )
+from .results import save_experiment, list_experiments, load_experiment
 from .compressor import PolarQuantMLX
 from .qjl import QJLMLX
 from .cache import TurboQuantCache
