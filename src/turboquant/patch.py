@@ -117,13 +117,16 @@ def compress_cache(
     bits: int = 4,
     window_size: int = 0,
     min_context: int = 0,
+    compact: bool = True,
 ) -> Dict:
     """
     Compress KV cache in-place using TurboQuant.
 
-    v0.5.0: Stores uint8 indices + float16 norms instead of dequantized FP16.
-    Decompression happens on-demand during generation. Per-layer eval prevents
-    memory thrashing at high context lengths.
+    Stores uint8 indices + float16 norms. When compact=True (default),
+    frees the FP16 tensors for real memory savings and writes dequantized
+    FP16 back for generation to work with standard attention.
+
+    Per-layer eval prevents memory thrashing at high context lengths.
 
     Args:
         cache: List of MLX KVCache objects from make_prompt_cache().
@@ -221,39 +224,46 @@ def compress_cache(
 
         layers_compressed += 1
 
+    # ── Measure FP16 memory BEFORE compacting ──
+    original_bytes = 0
+    for c in cache:
+        if hasattr(c, 'keys') and c.keys is not None:
+            original_bytes += c.keys.nbytes + c.values.nbytes
+
+    # ── Compact: free FP16, keep only indices + norms ──
+    if compact and layers_compressed > 0:
+        compact_cache(cache)
+        # Restore dequantized FP16 for generation to work with standard attention
+        restore_cache(cache)
+
     elapsed_ms = (time.time() - t0) * 1000
 
     # Real cosine: averaged across all compressed layers (measured before overwrite)
     cos = cosine_sum / cosine_count if cosine_count > 0 else 0.0
 
-    # ── Measure ACTUAL memory from real tensors, not formulas ──
-    actual_kv_bytes = 0  # FP16 keys + values still in cache
-    actual_compressed_bytes = 0  # uint8 indices + float16 norms
-
+    # ── Measure ACTUAL memory after compress+compact+restore ──
+    after_bytes = 0
+    compressed_bytes = 0
     for c in cache:
         if hasattr(c, 'keys') and c.keys is not None:
-            actual_kv_bytes += c.keys.nbytes + c.values.nbytes
+            after_bytes += c.keys.nbytes + c.values.nbytes
         if hasattr(c, '_tq_k_indices') and c._tq_k_indices is not None:
-            actual_compressed_bytes += (
+            compressed_bytes += (
                 c._tq_k_indices.nbytes + c._tq_k_norms.nbytes +
                 c._tq_v_indices.nbytes + c._tq_v_norms.nbytes
             )
 
-    # After compress_cache(), FP16 tensors are still in memory (dequantized back).
-    # Call compact_cache() after this to free FP16 and get real savings.
-    # Report both: what's actually in memory, and what compact_cache() would achieve.
-    potential_mb = actual_compressed_bytes / 1024 / 1024
-    actual_mb = actual_kv_bytes / 1024 / 1024
-    ratio = actual_kv_bytes / actual_compressed_bytes if actual_compressed_bytes > 0 else 0
+    original_mb = original_bytes / 1024 / 1024
+    compressed_mb = compressed_bytes / 1024 / 1024
+    ratio = original_bytes / compressed_bytes if compressed_bytes > 0 else 0
 
     return {
         "cosine": round(cos, 4),
         "compress_ms": round(elapsed_ms, 0),
         "layers_compressed": layers_compressed,
-        "kv_cache_mb": round(actual_mb, 1),
-        "compressed_mb": round(potential_mb, 1),
+        "original_mb": round(original_mb, 1),
+        "compressed_mb": round(compressed_mb, 1),
         "ratio": round(ratio, 1),
-        "note": "KV cache still FP16 in memory. Call compact_cache() to free FP16 and get real savings.",
     }
 
 
