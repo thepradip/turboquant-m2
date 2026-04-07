@@ -110,19 +110,6 @@ def chunked_prefill(
     return logits
 
 
-# Known cosine values for (bits, head_dim) — deterministic property of
-# the Lloyd-Max codebook on unit-sphere vectors. Computing per-run wastes
-# ~67 MB/layer of allocation for a number that never changes.
-_KNOWN_COSINE = {
-    (4, 256): 0.9953,
-    (4, 128): 0.9941,
-    (3, 256): 0.9870,
-    (3, 128): 0.9850,
-    (2, 256): 0.9650,
-    (2, 128): 0.9620,
-}
-
-
 def compress_cache(
     cache: List[Any],
     model: Any = None,
