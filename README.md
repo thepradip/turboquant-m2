@@ -86,16 +86,37 @@ text = tok.apply_chat_template(
 )
 ids = mx.array(tok.encode(text))
 
-# 3. Prefill + compress (two lines)
+# 3. Prefill + compress
 cache = make_prompt_cache(model)
 logits = chunked_prefill(model, ids, cache, chunk_size=2048)
-result = compress_cache(cache, model=model, bits=4)
+result = compress_cache(cache, model=model, bits=4, compact=False)
 
-# 4. Generate (standard loop, no changes needed)
+# 4. Generate (standard loop — compact=False keeps FP16 for compatibility)
 y = mx.argmax(logits[:, -1, :], axis=-1)
 tokens = []
 for _ in range(200):
     logits = model(y.reshape(1, -1), cache=cache)
+    mx.eval(logits)
+    y = mx.argmax(logits[:, -1, :], axis=-1)
+    if y.item() == tok.eos_token_id:
+        break
+    tokens.append(y.item())
+print(tok.decode(tokens))
+```
+
+**Memory-saving mode** (uses `generate_step` for real memory savings):
+
+```python
+from turboquant import compress_cache, generate_step, chunked_prefill
+
+cache = make_prompt_cache(model)
+logits = chunked_prefill(model, ids, cache, chunk_size=2048)
+compress_cache(cache, model=model, bits=4)  # compact=True (default), frees FP16
+
+y = mx.argmax(logits[:, -1, :], axis=-1)
+tokens = []
+for _ in range(200):
+    logits = generate_step(model, y[:, None], cache)  # decompress → generate → recompress
     mx.eval(logits)
     y = mx.argmax(logits[:, -1, :], axis=-1)
     if y.item() == tok.eos_token_id:

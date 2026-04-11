@@ -281,7 +281,7 @@ def generate_answer(model, tokenizer, prompt, kv_mode, bits, max_tokens=500):
     compress_ms = 0
     if kv_mode != "fp16":
         t1 = time.time()
-        comp_info = compress_cache(cache, model=model, bits=bits)
+        comp_info = compress_cache(cache, model=model, bits=bits, compact=False)
         compress_ms = (time.time() - t1) * 1000
 
     ttft_ms = prefill_ms + compress_ms

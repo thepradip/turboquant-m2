@@ -398,14 +398,18 @@ def generate_step(model, token_id, cache):
     """
     One generation step with compressed KV cache.
 
-    Decompresses cache → runs model forward → appends new KV → recompresses.
-    Only 1 layer's FP16 is in memory at a time during decompression.
+    Decompresses all layers → model forward → quantizes new token → recompacts.
 
-    This is the production path that actually saves memory.
+    Memory behavior: during the forward pass, full FP16 KV is temporarily in
+    memory (same as standard generation). After the step, FP16 is freed and
+    only compressed indices remain. Net savings = between steps, not during.
+
+    NOTE: Only works with window_size=0 (default). If compress_cache was called
+    with window_size > 0, use compact=False instead and generate normally.
 
     Args:
         model: MLX model.
-        token_id: mx.array of shape (1,) or int — the token to process.
+        token_id: mx.array of shape (1, 1) — the token to process.
         cache: List of KVCache objects (compacted via compress_cache with compact=True).
 
     Returns:
@@ -415,7 +419,7 @@ def generate_step(model, token_id, cache):
 
         cache = make_prompt_cache(model)
         logits = chunked_prefill(model, ids, cache)
-        compress_cache(cache, model=model, bits=4)  # compact=True by default
+        compress_cache(cache, model=model, bits=4)  # compact=True, window_size=0
 
         y = mx.argmax(logits[:, -1, :], axis=-1)
         for _ in range(max_tokens):
@@ -438,11 +442,8 @@ def generate_step(model, token_id, cache):
     logits = model(token_id, cache=cache)
     mx.eval(logits)
 
-    # Recompress: the new token is now in the FP16 cache.
-    # We need to re-quantize the new token and compact again.
+    # Recompress: quantize new token, append to compressed storage, free FP16.
     if any_compacted:
-        # The new token was appended to FP16 keys/values by the model.
-        # Re-quantize the full cache (fast — codebook is cached, only new token is new).
         for c in cache:
             if not hasattr(c, '_tq_k_compressor'):
                 continue
@@ -450,21 +451,17 @@ def generate_step(model, token_id, cache):
             k_mse = c._tq_k_compressor
             v_mse = c._tq_v_compressor
             bits = c._tq_bits
-            end = c._tq_compress_end
 
-            # The new token is at position cache.offset - 1
-            # Quantize it and append to compressed storage
+            # Quantize only the new token (last position)
             new_k = c.keys[:, :, -1:, :].astype(mx.float32)
             new_v = c.values[:, :, -1:, :].astype(mx.float32)
 
             k_norm = mx.maximum(mx.sqrt(mx.sum(new_k * new_k, axis=-1, keepdims=True)), 1e-8)
-            k_unit = new_k / k_norm
-            k_idx = k_mse.quantize(k_unit)
+            k_idx = k_mse.quantize(new_k / k_norm)
             k_packed = pack_indices(k_idx, bits)
 
             v_norm = mx.maximum(mx.sqrt(mx.sum(new_v * new_v, axis=-1, keepdims=True)), 1e-8)
-            v_unit = new_v / v_norm
-            v_idx = v_mse.quantize(v_unit)
+            v_idx = v_mse.quantize(new_v / v_norm)
             v_packed = pack_indices(v_idx, bits)
 
             # Append to compressed storage
@@ -474,9 +471,13 @@ def generate_step(model, token_id, cache):
             c._tq_v_norms = mx.concatenate([c._tq_v_norms, v_norm.astype(mx.float16)], axis=2)
             c._tq_compress_end = c.offset
 
+            # Clear window buffer (no longer valid after new tokens appended)
+            c._tq_window_keys = None
+            c._tq_window_values = None
+
             mx.eval(c._tq_k_indices, c._tq_k_norms, c._tq_v_indices, c._tq_v_norms)
 
-            # Free FP16 again
+            # Free FP16 — back to compressed only
             c.keys = None
             c.values = None
             c._tq_compacted = True
