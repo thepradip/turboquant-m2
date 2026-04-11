@@ -13,7 +13,6 @@ from .patch import (
 )
 from .results import save_experiment, list_experiments, load_experiment
 from .compressor import PolarQuantMLX
-from .qjl import QJLMLX
 from .cache import TurboQuantCache
 from .attention import turboquant_sdpa
 from .bonsai_loader import load_bonsai_1bit
