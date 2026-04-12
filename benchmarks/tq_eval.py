@@ -552,9 +552,15 @@ def run_needle_suite(model, tokenizer, configs, contexts, output_path, results):
 #  Aggregation
 # ════════════════════════════════════════════════════════════
 
-def aggregate(results):
-    """Compute summary statistics from raw results."""
+def aggregate(results, questions=None):
+    """Compute summary statistics from raw results.
+    If questions provided, also computes filtered scores using only reliable questions."""
     summary = {"quality": {}, "needles": {}, "degradation": {}}
+
+    # Build reliable question set
+    reliable_ids = None
+    if questions:
+        reliable_ids = {q["id"] for q in questions if q.get("reliable", True)}
 
     for cfg, answers in results.get("answers", {}).items():
         if not answers:
@@ -609,6 +615,20 @@ def aggregate(results):
             "judge_partial": j_partial if j_scores else None,
             "judge_by_category": {cat: {"avg_score": round(mean(v["scores"]), 2), "pass": v["pass"], "total": v["total"]} for cat, v in j_by_cat.items()} if j_scores else None,
         }
+
+        # Filtered scores (reliable questions only)
+        if reliable_ids:
+            r_answers = [a for a in answers if a["id"] in reliable_ids]
+            r_passed = sum(1 for a in r_answers if a.get("passed"))
+            r_total = len(r_answers)
+            r_j_scores = [a["judge"]["score"] for a in r_answers if a.get("judge") and a["judge"].get("score", -1) >= 0]
+            r_j_pass = sum(1 for a in r_answers if a.get("judge") and a["judge"].get("verdict") == "PASS")
+            summary["quality"][cfg]["reliable"] = {
+                "passed": r_passed, "total": r_total,
+                "pass_rate": round(r_passed / r_total * 100, 1) if r_total else 0,
+                "judge_avg_score": round(mean(r_j_scores), 2) if r_j_scores else None,
+                "judge_pass": r_j_pass,
+            }
 
     # Needle summary
     for n in results.get("needles", []):
@@ -877,7 +897,7 @@ def main():
         run_needle_suite(model, tokenizer, args.configs, args.contexts, args.output, results)
 
     # Aggregate
-    results["summary"] = aggregate(results)
+    results["summary"] = aggregate(results, questions=questions)
 
     # Final save
     with open(args.output, "w") as f:
@@ -889,14 +909,19 @@ def main():
 
     # Print summary
     print(f"\n{'='*70}")
-    print(f"  RESULTS")
+    print(f"  RESULTS (54 reliable questions)")
     print(f"{'='*70}")
     for cfg, q in results["summary"].get("quality", {}).items():
         cos = f"cos={q['avg_cosine']:.4f}" if q.get("avg_cosine") else ""
-        judge = f" | judge={q['judge_avg_score']:.1f}/10" if q.get("judge_avg_score") else ""
-        print(f"  {cfg:>10}: {q['passed']}/{q['total']} ({q['pass_rate']}%) | "
-              f"TPS={q['avg_gen_tps']} | TTFT={q['avg_ttft_ms']:.0f}ms | "
-              f"wall={q['total_wall_s']}s {cos}{judge}")
+        r = q.get("reliable", {})
+        if r:
+            score = f" | score={r['judge_avg_score']:.1f}/10" if r.get("judge_avg_score") else ""
+            print(f"  {cfg:>10}: {r['passed']}/{r['total']} ({r['pass_rate']}%){score} | "
+                  f"TPS={q['avg_gen_tps']} | TTFT={q['avg_ttft_ms']:.0f}ms {cos}")
+        else:
+            score = f" | score={q['judge_avg_score']:.1f}/10" if q.get("judge_avg_score") else ""
+            print(f"  {cfg:>10}: {q['passed']}/{q['total']} ({q['pass_rate']}%){score} | "
+                  f"TPS={q['avg_gen_tps']} | TTFT={q['avg_ttft_ms']:.0f}ms {cos}")
     for cfg, ctx_data in results["summary"].get("needles", {}).items():
         for ctx, nd in ctx_data.items():
             print(f"  {cfg:>10} @ {ctx}: {nd['passed']}/{nd['total']} ({nd['rate']}%)")

@@ -10,9 +10,9 @@ ROOT = os.path.dirname(__file__)
 OUTPUT = os.path.join(ROOT, "tq_eval_report.html")
 
 FILES = [
-    ("Qwen3.5-4B", os.path.join(ROOT, "tq_eval_qwen3.5_4b_mlx_4bit.json"), "#3b82f6"),
-    ("Gemma-4 E4B", os.path.join(ROOT, "tq_eval_gemma_4_e4b_it_4bit.json"), "#ef4444"),
-    ("Qwen3.5-9B", os.path.join(ROOT, "tq_eval_qwen3.5_9b_4bit.json"), "#22c55e"),
+    ("Qwen3.5-4B", os.path.join(ROOT, "tq_eval_qwen3.5_4b_mlx_4bit_v2.json"), "#3b82f6"),
+    ("Gemma-4 E4B", os.path.join(ROOT, "tq_eval_gemma_4_e4b_it_4bit_v2.json"), "#ef4444"),
+    ("Qwen3.5-9B", os.path.join(ROOT, "tq_eval_qwen3.5_9b_4bit_v2.json"), "#22c55e"),
 ]
 
 CAT_COLORS = {
@@ -321,7 +321,7 @@ tbody tr:hover td { background: #f1f5f9; }
 ts = models[0]["raw"].get("timestamp", "")[:10]
 h += '<div class="hero">\n'
 h += '<h1>TurboQuant Eval Report</h1>\n'
-h += f'<p class="tagline">65 Questions &middot; 3 Models &middot; 3 KV Configs &middot; 585 Evaluations</p>\n'
+h += f'<p class="tagline">54 Reliable Questions (65 total, 11 filtered) &middot; 3 Models &middot; 3 KV Configs</p>\n'
 h += '<div class="pills">\n'
 for m in models:
     h += f'<span class="pill" style="background:{m["color"]};">{m["label"]}</span>\n'
@@ -345,8 +345,16 @@ for m in models:
     h += f'<div style="font-size:11px;color:var(--text-3);margin-bottom:16px;font-family:JetBrains Mono,monospace;">{m["config"].get("num_layers",0)}L / {m["config"].get("num_kv_heads",0)}KV / {m["config"].get("hidden_size",0)}h</div>\n'
     for cfg in CONFIGS:
         s = m["summary"].get(cfg, {})
-        pr = s.get("pass_rate", 0)
-        ja = s.get("judge_avg_score", 0) or 0
+        r = s.get("reliable", {})
+        # Use reliable scores as primary when available
+        if r:
+            pr = r.get("pass_rate", 0)
+            p_str = f'{r.get("passed",0)}/{r.get("total",0)}'
+            ja = r.get("judge_avg_score", 0) or 0
+        else:
+            pr = s.get("pass_rate", 0)
+            p_str = f'{s.get("passed",0)}/{s.get("total",0)}'
+            ja = s.get("judge_avg_score", 0) or 0
         cos = s.get("avg_cosine")
         tps = s.get("avg_gen_tps", 0)
         cls = "green" if pr >= 70 else "yellow" if pr >= 50 else "red"
@@ -354,7 +362,7 @@ for m in models:
         h += f'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);">'
         h += f'<div><span style="font-weight:700;font-size:13px;">{CFG_LABELS[cfg]}</span>'
         h += f'<span style="color:var(--text-3);font-size:11px;margin-left:8px;">{tps:.0f} t/s {cos_str}</span></div>'
-        h += f'<div><span class="{cls} mono" style="font-weight:800;font-size:15px;">{s.get("passed",0)}/{s.get("total",0)}</span>'
+        h += f'<div><span class="{cls} mono" style="font-weight:800;font-size:15px;">{p_str}</span>'
         h += f'<span style="color:var(--text-3);font-size:11px;margin-left:8px;">{ja:.1f}</span></div></div>\n'
     qc = "green" if qd >= 0 else "red"
     h += f'<div style="margin-top:14px;padding:8px 12px;background:var(--surface);border-radius:8px;font-size:12px;">'
