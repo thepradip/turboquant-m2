@@ -409,6 +409,9 @@ for cfg in CONFIGS:
     h += f'<span class="pill pill-outline">{CFG_LABELS[cfg]}</span>\n'
 h += f'</div></div>\n'
 
+# ── Insights placeholder (rendered later, inserted here) ──
+h += '<!-- INSERT_INSIGHTS -->\n'
+
 # ── Summary Cards ──
 h += '<div class="sec"><h2><span class="dot" style="background:var(--indigo);"></span>Executive Summary</h2>\n'
 h += '<div class="g g3">\n'
@@ -715,12 +718,12 @@ for m in models:
     t3_c = m["summary"].get("tq_3bit",{}).get("judge_by_category",{}).get("coding",{}).get("avg_score",0)
     _coding_drops.append(round(fp_c - t3_c, 1))
 
-h += '<div class="sec">\n'
-h += '<h2><span class="dot" style="background:var(--indigo);"></span>Top 10 Insights</h2>\n'
-h += '<p class="desc">Data-driven findings from 585 evaluations across accuracy, latency, throughput, memory, and model capability.</p>\n'
+insights_html = '<div class="sec">\n'
+insights_html += '<h2><span class="dot" style="background:var(--indigo);"></span>Top 10 Insights</h2>\n'
+insights_html += f'<p class="desc">Data-driven findings from {TOTAL_Q} reliable questions across accuracy, latency, throughput, memory, and model capability.</p>\n'
 
 # ── Insight 1: Headline Numbers ──
-h += '<div class="g g4" style="margin-bottom:24px;">\n'
+insights_html += '<div class="g g4" style="margin-bottom:24px;">\n'
 headline_cards = [
     (_best_model["summary"]["fp16"].get("judge_avg_score",0), "/10", "Best Accuracy", f'{_best_model["label"]} FP16', "indigo"),
     (f'{_fastest["summary"]["fp16"]["avg_gen_tps"]:.0f}', " tok/s", "Fastest Throughput", f'{_fastest["label"]} FP16', "emerald"),
@@ -728,12 +731,12 @@ headline_cards = [
     (f'{mean(m["degradation"].get("tq_4bit_vs_fp16",{}).get("memory_savings_pct",0) for m in models):.1f}', "%", "KV Memory Saved", "TQ 4-bit (all models)", "indigo"),
 ]
 for val, unit, label, detail, color in headline_cards:
-    h += f'''<div class="c" style="text-align:center;border-top:3px solid var(--{color});">
+    insights_html += f'''<div class="c" style="text-align:center;border-top:3px solid var(--{color});">
 <div style="font-size:36px;font-weight:900;color:var(--{color});letter-spacing:-2px;font-family:JetBrains Mono,monospace;">{val}<span style="font-size:16px;font-weight:600;">{unit}</span></div>
 <div style="font-size:13px;font-weight:700;margin-top:4px;">{label}</div>
 <div style="font-size:11px;color:var(--text-3);margin-top:2px;">{detail}</div>
 </div>\n'''
-h += '</div>\n'
+insights_html += '</div>\n'
 
 # ── Insights as numbered cards with 2-column layout ──
 numbered_insights = []
@@ -811,22 +814,20 @@ numbered_insights.append(("rose", "Semantic Evaluation vs Keyword Matching",
     f'questions where expected numbers appeared in working steps but the model reached a wrong conclusion. '
     f'Semantic evaluation caught every case. Without it, reported accuracy would be inflated by ~8%.'))
 
-# Render as 2-column numbered list
-h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">\n'
+# Render as single-column full-width cards
 for i, (color, title, body) in enumerate(numbered_insights):
     num = i + 1
-    h += f'''<div class="c" style="border-left:4px solid var(--{color});padding:18px 22px;">
-<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-<div style="width:32px;height:32px;border-radius:50%;background:var(--{color});color:#fff;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:800;flex-shrink:0;">{num}</div>
-<div style="font-size:15px;font-weight:800;color:var(--{color});">{title}</div>
+    insights_html += f'''<div style="background:var(--card);border:1px solid var(--border);border-left:5px solid var(--{color});border-radius:var(--radius);padding:22px 28px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,0.04);">
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;">
+<div style="width:38px;height:38px;border-radius:50%;background:var(--{color});color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;flex-shrink:0;">{num}</div>
+<div style="font-size:17px;font-weight:800;color:var(--{color});letter-spacing:-0.3px;">{title}</div>
 </div>
-<div style="font-size:13px;color:var(--text-2);line-height:1.8;">{body}</div>
+<div style="font-size:14px;color:var(--text-2);line-height:1.9;padding-left:50px;">{body}</div>
 </div>\n'''
-h += '</div>\n'
 
 # ── Model Recommendation Cards ──
-h += '<h3 style="margin-top:32px;">Recommended Models</h3>\n'
-h += '<div class="g g3">\n'
+insights_html += '<h3 style="margin-top:32px;">Recommended Models</h3>\n'
+insights_html += '<div class="g g3">\n'
 recs = [
     ("emerald", "Best Overall", f"{models[0]['label']} (MLX-4bit)",
      f'Highest quality ({models[0]["summary"]["fp16"].get("judge_avg_score",0):.1f}/10), '
@@ -843,12 +844,15 @@ recs = [
      f'More fragile under compression ({models[1]["degradation"].get("tq_4bit_vs_fp16",{}).get("quality_delta",0):+.1f}%). Use FP16 for math-critical tasks.'),
 ]
 for color, tag, model_name, desc in recs:
-    h += f'''<div class="c" style="border-top:3px solid var(--{color});">
+    insights_html += f'''<div class="c" style="border-top:3px solid var(--{color});">
 <div style="font-size:11px;font-weight:700;color:var(--{color});text-transform:uppercase;letter-spacing:1.2px;margin-bottom:6px;">{tag}</div>
 <div style="font-size:20px;font-weight:900;letter-spacing:-0.5px;margin-bottom:10px;">{model_name}</div>
 <div style="font-size:13px;color:var(--text-2);line-height:1.75;">{desc}</div>
 </div>\n'''
-h += '</div></div>\n'
+insights_html += '</div></div>\n'
+
+# Insert insights after hero (before Executive Summary)
+h = h.replace('<!-- INSERT_INSIGHTS -->', insights_html)
 
 # ── Footer ──
 h += f'''<div class="divider"></div>
