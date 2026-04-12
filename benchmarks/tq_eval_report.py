@@ -25,14 +25,94 @@ CONFIGS = ["fp16", "tq_4bit", "tq_3bit"]
 CFG_COLORS = {"fp16": "#64748b", "tq_4bit": "#3b82f6", "tq_3bit": "#22c55e"}
 CFG_LABELS = {"fp16": "FP16", "tq_4bit": "TQ 4-bit", "tq_3bit": "TQ 3-bit"}
 
-# Load all data
+# Load reliable question IDs
+QUESTIONS_FILE = os.path.join(ROOT, "tq_eval_65_questions.json")
+with open(QUESTIONS_FILE) as f:
+    _qdata = json.load(f)
+RELIABLE_IDS = {q["id"] for q in _qdata["questions"] if q.get("reliable", True)}
+TOTAL_Q = len(RELIABLE_IDS)
+
+# Load all data and recompute summaries using only reliable questions
 models = []
 for label, path, color in FILES:
     with open(path) as f:
         raw = json.load(f)
-    s = raw.get("summary", {}).get("quality", {})
-    d = raw.get("summary", {}).get("degradation", {})
-    models.append({"label": label, "color": color, "raw": raw, "summary": s, "degradation": d,
+
+    # Filter answers to reliable only
+    filtered_answers = {}
+    for cfg in CONFIGS:
+        filtered_answers[cfg] = [a for a in raw.get("answers", {}).get(cfg, []) if a["id"] in RELIABLE_IDS]
+
+    # Recompute summary from filtered data
+    summary = {}
+    for cfg in CONFIGS:
+        answers = filtered_answers[cfg]
+        if not answers:
+            continue
+        m = [a["metrics"] for a in answers if a.get("metrics")]
+        passed = sum(1 for a in answers if a.get("passed"))
+        total = len(answers)
+
+        by_cat = defaultdict(lambda: {"passed": 0, "total": 0})
+        for a in answers:
+            by_cat[a["category"]]["total"] += 1
+            if a.get("passed"):
+                by_cat[a["category"]]["passed"] += 1
+        for cat in by_cat:
+            t = by_cat[cat]["total"]
+            by_cat[cat]["rate"] = round(by_cat[cat]["passed"] / t * 100, 1) if t else 0
+
+        cosines = [x["cosine"] for x in m if x.get("cosine") is not None]
+        ratios = [x["ratio"] for x in m if x.get("ratio") is not None]
+        j_scores = [a["judge"]["score"] for a in answers if a.get("judge") and a["judge"].get("score", -1) >= 0]
+        j_pass = sum(1 for a in answers if a.get("judge") and a["judge"].get("verdict") == "PASS")
+
+        j_by_cat = defaultdict(lambda: {"scores": [], "pass": 0, "total": 0})
+        for a in answers:
+            if a.get("judge") and a["judge"].get("score", -1) >= 0:
+                j_by_cat[a["category"]]["scores"].append(a["judge"]["score"])
+                j_by_cat[a["category"]]["total"] += 1
+                if a["judge"].get("verdict") == "PASS":
+                    j_by_cat[a["category"]]["pass"] += 1
+
+        summary[cfg] = {
+            "passed": passed, "total": total,
+            "pass_rate": round(passed / total * 100, 1) if total else 0,
+            "avg_gen_tps": round(mean(x["gen_tps"] for x in m), 1) if m else 0,
+            "med_gen_tps": round(median(x["gen_tps"] for x in m), 1) if m else 0,
+            "avg_ttft_ms": round(mean(x["ttft_ms"] for x in m), 0) if m else 0,
+            "total_wall_s": round(sum(x["wall_ms"] for x in m) / 1000, 1) if m else 0,
+            "avg_metal_peak_mb": round(mean(x["metal_peak_mb"] for x in m), 0) if m else 0,
+            "avg_kv_fp16_mb": round(mean(x["kv_fp16_mb"] for x in m), 2) if m else 0,
+            "avg_kv_compressed_mb": round(mean(x["kv_compressed_mb"] for x in m), 2) if m else 0,
+            "avg_cosine": round(mean(cosines), 4) if cosines else None,
+            "avg_ratio": round(mean(ratios), 2) if ratios else None,
+            "avg_p50_token_ms": round(mean(x["p50_token_ms"] for x in m), 2) if m else 0,
+            "avg_p99_token_ms": round(mean(x["p99_token_ms"] for x in m), 2) if m else 0,
+            "by_category": dict(by_cat),
+            "judge_avg_score": round(mean(j_scores), 2) if j_scores else None,
+            "judge_pass": j_pass if j_scores else None,
+            "judge_by_category": {cat: {"avg_score": round(mean(v["scores"]), 2), "pass": v["pass"], "total": v["total"]} for cat, v in j_by_cat.items()} if j_scores else None,
+        }
+
+    # Recompute degradation from filtered data
+    degradation = {}
+    fp16_s = summary.get("fp16", {})
+    for cfg in ["tq_4bit", "tq_3bit"]:
+        tq_s = summary.get(cfg, {})
+        if not fp16_s or not tq_s:
+            continue
+        qd = round(tq_s["pass_rate"] - fp16_s["pass_rate"], 1)
+        td = round((tq_s["avg_gen_tps"] - fp16_s["avg_gen_tps"]) / fp16_s["avg_gen_tps"] * 100, 1) if fp16_s.get("avg_gen_tps") else 0
+        ms = round((1 - tq_s["avg_kv_compressed_mb"] / fp16_s["avg_kv_fp16_mb"]) * 100, 1) if fp16_s.get("avg_kv_fp16_mb") else 0
+        degradation[f"{cfg}_vs_fp16"] = {
+            "quality_delta": qd, "tps_delta_pct": td, "memory_savings_pct": ms,
+        }
+
+    # Store filtered answers for detail tables
+    raw["_filtered_answers"] = filtered_answers
+
+    models.append({"label": label, "color": color, "raw": raw, "summary": summary, "degradation": degradation,
                     "model": raw["model"], "config": raw.get("model_config", {})})
 
 
@@ -528,7 +608,7 @@ h += '</tbody></table></div></div>\n'
 h += '<div class="sec"><h2><span class="dot" style="background:var(--amber);"></span>Model Profiles</h2>\n'
 h += '<div class="g g3">\n'
 
-fp16_maps = {m["label"]: {a["id"]: a for a in m["raw"]["answers"]["fp16"]} for m in models}
+fp16_maps = {m["label"]: {a["id"]: a for a in m["raw"]["_filtered_answers"]["fp16"]} for m in models}
 all_ids = list(fp16_maps[models[0]["label"]].keys())
 
 for m in models:
@@ -576,7 +656,7 @@ h += '</tr></thead><tbody>\n'
 
 for m in models:
     for cfg in CONFIGS:
-        for a in m["raw"]["answers"].get(cfg, []):
+        for a in m["raw"]["_filtered_answers"].get(cfg, []):
             kw = a.get("keyword_passed", a.get("passed", False))
             j = a.get("judge", {})
             jv = j.get("verdict", "?")
@@ -599,7 +679,7 @@ h += '</tbody></table></div></div>\n'
 # ═══════════════════════════════════════════
 
 # Precompute stats for insights
-_fp_maps = {m["label"]: {a["id"]: a for a in m["raw"]["answers"]["fp16"]} for m in models}
+_fp_maps = {m["label"]: {a["id"]: a for a in m["raw"]["_filtered_answers"]["fp16"]} for m in models}
 _all_ids = list(_fp_maps[models[0]["label"]].keys())
 
 # Best/worst models
@@ -624,7 +704,7 @@ _hard = sum(1 for qid in _all_ids if not any(_fp_maps[m["label"]].get(qid,{}).ge
 
 # False positives
 _total_fp = sum(
-    sum(1 for cfg in CONFIGS for a in m["raw"]["answers"].get(cfg, [])
+    sum(1 for cfg in CONFIGS for a in m["raw"]["_filtered_answers"].get(cfg, [])
         if a.get("keyword_passed", a.get("passed", False)) and a.get("judge", {}).get("verdict") == "FAIL")
     for m in models)
 
@@ -773,7 +853,7 @@ h += '</div></div>\n'
 # ── Footer ──
 h += f'''<div class="divider"></div>
 <div class="footer">
-TurboQuant Eval Report &middot; 585 Evaluations &middot; {ts}<br>
+TurboQuant Eval Report &middot; {TOTAL_Q} Reliable Questions &times; 3 Configs &times; 3 Models &middot; {ts}<br>
 {' &middot; '.join(m['model'].split('/')[-1] for m in models)}
 </div>
 </div>
