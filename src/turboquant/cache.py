@@ -9,7 +9,7 @@ Values: MSE indices + norms
 """
 
 import mlx.core as mx
-from .compressor import PolarQuantMLX
+from .compressor import PolarQuantMLX, pack_indices, unpack_indices
 
 
 class TurboQuantCache:
@@ -26,9 +26,10 @@ class TurboQuantCache:
     step = 256  # MLX checks this
 
     def __init__(self, head_dim: int, key_bits: int = 4, value_bits: int = 4,
-                 layer_idx: int = 0):
+                 layer_idx: int = 0, fused: bool = False):
         self.head_dim = head_dim
         self.layer_idx = layer_idx
+        self.fused = fused  # If True, update_and_fetch returns empty placeholders
 
         self.key_mse = PolarQuantMLX(head_dim, key_bits, seed=42 + layer_idx)
         self.val_mse = PolarQuantMLX(head_dim, value_bits, seed=1000 + layer_idx)
@@ -40,26 +41,36 @@ class TurboQuantCache:
         self.v_norms = None      # float16: (B, n_kv, seq, 1)
         self.offset = 0
 
+        # For fused mode: store the most recent uncompressed token for SDPA
+        self._new_keys = None    # (B, n_kv, n_new, head_dim) float16
+        self._new_values = None  # (B, n_kv, n_new, head_dim) float16
+
     def _dequantize_keys(self) -> mx.array:
-        """Reconstruct FP16 keys from indices + norms."""
-        k_hat = self.key_mse.dequantize(self.k_indices)
+        """Reconstruct FP16 keys from packed indices + norms."""
+        k_idx = unpack_indices(self.k_indices, self.key_mse.bits, self.head_dim)
+        k_hat = self.key_mse.dequantize(k_idx)
         return (k_hat * self.k_norms.astype(mx.float32)).astype(mx.float16)
 
     def _dequantize_values(self) -> mx.array:
-        """Reconstruct FP16 values from indices + norms."""
-        v_hat = self.val_mse.dequantize(self.v_indices)
+        """Reconstruct FP16 values from packed indices + norms."""
+        v_idx = unpack_indices(self.v_indices, self.val_mse.bits, self.head_dim)
+        v_hat = self.val_mse.dequantize(v_idx)
         return (v_hat * self.v_norms.astype(mx.float32)).astype(mx.float16)
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """
-        Compress new K,V and return dequantized versions.
+        Compress new K,V and return values for attention.
+
+        In fused mode: compresses to indices, returns the new FP16 tokens only
+        (fused SDPA reads compressed indices directly from self).
+        In standard mode: returns full dequantized sequence (backward compat).
 
         Args:
             keys: (B, n_kv_heads, new_seq, head_dim) — after RoPE
             values: (B, n_kv_heads, new_seq, head_dim)
 
         Returns:
-            (dequantized_keys, dequantized_values) — full sequence
+            (keys_for_sdpa, values_for_sdpa)
         """
         k_f = keys.astype(mx.float32)
         v_f = values.astype(mx.float32)
@@ -80,18 +91,31 @@ class TurboQuantCache:
         k_norms_stored = k_norms.astype(mx.float16)
         v_norms_stored = v_norms.astype(mx.float16)
 
+        # Pack indices for memory savings (4-bit: 2 per byte = 2x smaller)
+        k_packed = pack_indices(k_indices, self.key_mse.bits)
+        v_packed = pack_indices(v_indices, self.val_mse.bits)
+
         if self.k_indices is None:
-            self.k_indices = k_indices
+            self.k_indices = k_packed
             self.k_norms = k_norms_stored
-            self.v_indices = v_indices
+            self.v_indices = v_packed
             self.v_norms = v_norms_stored
         else:
-            self.k_indices = mx.concatenate([self.k_indices, k_indices], axis=2)
+            self.k_indices = mx.concatenate([self.k_indices, k_packed], axis=2)
             self.k_norms = mx.concatenate([self.k_norms, k_norms_stored], axis=2)
-            self.v_indices = mx.concatenate([self.v_indices, v_indices], axis=2)
+            self.v_indices = mx.concatenate([self.v_indices, v_packed], axis=2)
             self.v_norms = mx.concatenate([self.v_norms, v_norms_stored], axis=2)
 
         self.offset += keys.shape[2]
+
+        if self.fused:
+            # Fused mode: return the new FP16 tokens only.
+            # Fused SDPA will read compressed indices directly from self,
+            # and use these new tokens as the uncompressed window.
+            self._new_keys = keys
+            self._new_values = values
+            # Return placeholders that match expected shapes but fused SDPA ignores
+            return keys, values
 
         return self._dequantize_keys(), self._dequantize_values()
 

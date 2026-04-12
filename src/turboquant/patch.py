@@ -519,9 +519,8 @@ def generate_step_fused(model, token_id, cache):
         logits: mx.array
 
     Example::
-        cache = make_prompt_cache(model)
+        cache = make_turboquant_cache(model, bits=4, fused=True)
         logits = chunked_prefill(model, ids, cache)
-        compress_cache(cache, model=model, bits=4)
         patch_model_fused(model)
 
         y = mx.argmax(logits[:, -1, :], axis=-1)
@@ -600,19 +599,22 @@ def patch_model_fused(model):
     _original_sdpa = None
 
     def _patched_sdpa(queries, keys, values, cache=None, scale=1.0, mask=None, **kwargs):
-        # Check if cache has compressed data
+        from .cache import TurboQuantCache
+
+        # Check if cache is a fused TurboQuantCache
+        if cache is not None and isinstance(cache, TurboQuantCache) and cache.fused and cache.k_indices is not None:
+            # In fused mode, keys/values from update_and_fetch are just the new tokens
+            # Fused SDPA reads compressed indices directly from cache
+            return fused_turboquant_sdpa(
+                queries, cache, scale=scale, mask=mask,
+                new_keys=None, new_values=None)
+
+        # Check if cache has compressed data from compress_cache()
         if cache is not None and hasattr(cache, '_tq_k_indices') and cache._tq_k_indices is not None:
-            # Split: compressed portion vs new FP16 tokens
             n_compressed = cache._tq_compress_end
             n_total = keys.shape[2]
-
-            if n_total > n_compressed:
-                new_k = keys[:, :, n_compressed:, :]
-                new_v = values[:, :, n_compressed:, :]
-            else:
-                new_k = None
-                new_v = None
-
+            new_k = keys[:, :, n_compressed:, :] if n_total > n_compressed else None
+            new_v = values[:, :, n_compressed:, :] if n_total > n_compressed else None
             return fused_turboquant_sdpa(
                 queries, cache, scale=scale, mask=mask,
                 new_keys=new_k, new_values=new_v)
@@ -640,8 +642,16 @@ def patch_model_fused(model):
 #  Patched model attention (experimental, non-fused)
 # ═══════════════════════════════════════════════════════
 
-def make_turboquant_cache(model, bits: int = 4, value_bits: int = None) -> List:
-    """Create TurboQuant caches for all KVCache layers, default for others."""
+def make_turboquant_cache(model, bits: int = 4, value_bits: int = None, fused: bool = False) -> List:
+    """Create TurboQuant caches for all KVCache layers, default for others.
+
+    Args:
+        model: MLX model.
+        bits: Key quantization bits (2, 3, or 4).
+        value_bits: Value quantization bits (default: same as bits).
+        fused: If True, caches work with fused attention (no FP16 storage).
+               Must call patch_model_fused(model) before generation.
+    """
     from mlx_lm.models.cache import make_prompt_cache, KVCache
     from .cache import TurboQuantCache
 
@@ -652,7 +662,7 @@ def make_turboquant_cache(model, bits: int = 4, value_bits: int = None) -> List:
     caches = []
     for i in range(len(default)):
         if isinstance(default[i], KVCache):
-            caches.append(TurboQuantCache(head_dim, key_bits=bits, value_bits=vb, layer_idx=i))
+            caches.append(TurboQuantCache(head_dim, key_bits=bits, value_bits=vb, layer_idx=i, fused=fused))
         else:
             caches.append(default[i])
     return caches

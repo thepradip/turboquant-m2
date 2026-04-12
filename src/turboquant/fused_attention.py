@@ -33,14 +33,14 @@ def prerotate_queries(queries, rotation_t):
     return queries.astype(mx.float32) @ rotation_t
 
 
-def compressed_scores(q_rot, packed_k_indices, k_norms, centroids, bits, head_dim, n_rep, scale):
+def compressed_scores(q_rot, k_indices, k_norms, centroids, bits, head_dim, n_rep, scale):
     """Compute attention scores for compressed K positions.
 
     No rotation on K side — Q was pre-rotated instead.
 
     Args:
         q_rot: (B, n_heads, seq_q, head_dim) float32 — pre-rotated queries
-        packed_k_indices: (B, n_kv, seq_compressed, packed_dim) uint8
+        k_indices: (B, n_kv, seq_compressed, dim) uint8 — packed or unpacked
         k_norms: (B, n_kv, seq_compressed, 1) float16
         centroids: (n_centroids,) float32
         bits: int (2, 3, or 4)
@@ -51,8 +51,11 @@ def compressed_scores(q_rot, packed_k_indices, k_norms, centroids, bits, head_di
     Returns:
         (B, n_heads, seq_q, seq_compressed) float32
     """
-    # Unpack bit-packed indices
-    k_idx = unpack_indices(packed_k_indices, bits, head_dim)
+    # Unpack if bit-packed, otherwise use as-is
+    if k_indices.shape[-1] != head_dim:
+        k_idx = unpack_indices(k_indices, bits, head_dim)
+    else:
+        k_idx = k_indices
 
     # Gather centroids — each element becomes one of 2^bits float32 values
     # Shape: (B, n_kv, seq_compressed, head_dim) float32
@@ -89,8 +92,11 @@ def compressed_value_aggregate(weights, packed_v_indices, v_norms, centroids_v,
     Returns:
         (B, n_heads, seq_q, head_dim) float32
     """
-    # Unpack and gather centroids
-    v_idx = unpack_indices(packed_v_indices, bits, head_dim)
+    # Unpack if bit-packed, otherwise use as-is
+    if packed_v_indices.shape[-1] != head_dim:
+        v_idx = unpack_indices(packed_v_indices, bits, head_dim)
+    else:
+        v_idx = packed_v_indices
     v_centroid_vals = centroids_v[v_idx]
 
     # Scale by norms in rotated space
@@ -129,15 +135,34 @@ def fused_turboquant_sdpa(queries, cache_layer, scale, mask=None,
     Returns:
         (B, n_heads, seq_q, head_dim) — attention output
     """
+    from .cache import TurboQuantCache
+
     B, n_heads, seq_q, d = queries.shape
-    k_compressor = cache_layer._tq_k_compressor
-    v_compressor = cache_layer._tq_v_compressor
-    bits = cache_layer._tq_bits
-    head_dim = cache_layer._tq_head_dim
-    n_kv_heads = cache_layer._tq_k_indices.shape[1]
+
+    # Support both TurboQuantCache (fused mode) and standard cache with _tq_* attrs
+    if isinstance(cache_layer, TurboQuantCache):
+        k_compressor = cache_layer.key_mse
+        v_compressor = cache_layer.val_mse
+        bits = cache_layer.key_mse.bits
+        head_dim = cache_layer.head_dim
+        k_indices = cache_layer.k_indices
+        k_norms = cache_layer.k_norms
+        v_indices = cache_layer.v_indices
+        v_norms = cache_layer.v_norms
+    else:
+        k_compressor = cache_layer._tq_k_compressor
+        v_compressor = cache_layer._tq_v_compressor
+        bits = cache_layer._tq_bits
+        head_dim = cache_layer._tq_head_dim
+        k_indices = cache_layer._tq_k_indices
+        k_norms = cache_layer._tq_k_norms
+        v_indices = cache_layer._tq_v_indices
+        v_norms = cache_layer._tq_v_norms
+
+    n_kv_heads = k_indices.shape[1]
     n_rep = n_heads // n_kv_heads
 
-    has_compressed = cache_layer._tq_k_indices is not None
+    has_compressed = k_indices is not None
     has_new = new_keys is not None and new_keys.shape[2] > 0
 
     all_scores = []
@@ -146,7 +171,7 @@ def fused_turboquant_sdpa(queries, cache_layer, scale, mask=None,
     if has_compressed:
         q_rot_k = prerotate_queries(queries, k_compressor.rotation_t)
         scores_c = compressed_scores(
-            q_rot_k, cache_layer._tq_k_indices, cache_layer._tq_k_norms,
+            q_rot_k, k_indices, k_norms,
             k_compressor.centroids, bits, head_dim, n_rep, scale)
         all_scores.append(scores_c)
 
@@ -171,15 +196,15 @@ def fused_turboquant_sdpa(queries, cache_layer, scale, mask=None,
     output = mx.zeros((B, n_heads, seq_q, head_dim), dtype=mx.float32)
 
     if has_compressed:
-        seq_c = cache_layer._tq_k_indices.shape[2]
+        seq_c = k_indices.shape[2]
         weights_c = weights[:, :, :, :seq_c]
         output_c = compressed_value_aggregate(
-            weights_c, cache_layer._tq_v_indices, cache_layer._tq_v_norms,
+            weights_c, v_indices, v_norms,
             v_compressor.centroids, v_compressor.rotation, bits, head_dim, n_rep)
         output = output + output_c
 
     if has_new:
-        seq_c = cache_layer._tq_k_indices.shape[2] if has_compressed else 0
+        seq_c = k_indices.shape[2] if has_compressed else 0
         weights_n = weights[:, :, :, seq_c:]
         new_v = new_values.astype(mx.float32)
         if n_rep > 1:
