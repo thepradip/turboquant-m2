@@ -5,7 +5,8 @@ Tests one model at a time across context lengths: 1K, 2K, 4K, 8K, 16K, 32K, 64K.
 Three modes per context:
   - baseline: FP16 KV cache (no compression)
   - mlx_quantized: MLX built-in QuantizedKVCache (4-bit group-wise)
-  - turboquant: TurboQuant PolarQuant compression (4-bit Lloyd-Max)
+  - turboquant: TurboQuant compatibility mode (compact=False) so decode
+    uses the standard generation loop while still reporting compressed size
 
 Results saved via save_experiment() to results/ directory.
 
@@ -133,7 +134,8 @@ def run_single_test(model, tokenizer, ids, context_len, mode, model_name):
             compress_result = compress_cache(cache, model=model, bits=BITS, compact=False)
             compress_ms = compress_result.get("compress_ms", 0)
             result["kv_memory_after_mb"] = round(measure_kv_mb(cache), 1)
-            # v0.5.0: measure real compressed size from indices+norms
+            # compact=False keeps FP16 for the standard generation loop.
+            # Report the stored compressed representation separately.
             comp_bytes = 0
             for c in cache:
                 if hasattr(c, '_tq_k_indices') and c._tq_k_indices is not None:
@@ -231,11 +233,15 @@ def run_model_benchmark(model_name):
             if result["passed"]:
                 kv_before = result.get("kv_memory_before_mb", 0)
                 kv_after = result.get("kv_memory_after_mb", 0)
-                saved = kv_before - kv_after
                 extra = ""
                 if mode == "turboquant":
+                    stored = result.get("kv_compressed_mb")
                     extra = f" cos={result.get('cosine', '?')}"
-                if mode != "baseline":
+                    if stored is not None:
+                        extra += f" stored={stored:.1f}MB"
+                    extra += f" fp16-loop comp={result.get('compress_ms', 0):.0f}ms"
+                elif mode != "baseline":
+                    saved = kv_before - kv_after
                     extra += f" saved={saved:.1f}MB"
                     extra += f" comp={result.get('compress_ms', 0):.0f}ms"
 
@@ -254,7 +260,7 @@ def run_model_benchmark(model_name):
                 compress_result={
                     k: result[k] for k in [
                         "cosine", "compress_ms", "layers_compressed",
-                        "original_mb", "compressed_mb", "saved_mb", "ratio",
+                        "original_mb", "compressed_mb", "ratio",
                     ] if k in result
                 } or None,
                 model=model,

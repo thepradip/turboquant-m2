@@ -248,9 +248,8 @@ def llm_judge(question, reference_answer, model_answer, category, client, judge_
 
 
 def generate_answer(model, tokenizer, prompt, kv_mode, bits, max_tokens=500):
-    """Generate using fused production path: compact=True + generate_step_fused() for TQ modes.
-    FP16 uses standard generation (no compression)."""
-    from turboquant import generate_step_fused, patch_model_fused
+    """Generate with compress_cache(compact=False) — quality benchmark.
+    Measures compression ratio and quality impact. Standard generation loop."""
 
     stop_tokens = _get_stop_tokens(tokenizer)
     ids = mx.array(tokenizer.encode(prompt))
@@ -282,14 +281,12 @@ def generate_answer(model, tokenizer, prompt, kv_mode, bits, max_tokens=500):
 
     comp_info = None
     compress_ms = 0
-    use_fused = False
+    comp_info = None
+    compress_ms = 0
     if kv_mode != "fp16":
         t1 = time.time()
-        comp_info = compress_cache(cache, model=model, bits=bits, compact=True)
+        comp_info = compress_cache(cache, model=model, bits=bits, compact=False)
         compress_ms = (time.time() - t1) * 1000
-        use_fused = True
-        if not getattr(model, '_tq_fused_patched', False):
-            patch_model_fused(model)
 
     ttft_ms = prefill_ms + compress_ms
     mx.eval(mx.array([0]))
@@ -305,11 +302,8 @@ def generate_answer(model, tokenizer, prompt, kv_mode, bits, max_tokens=500):
             break
         t_tok = time.time()
         tokens.append(tok_id)
-        if use_fused:
-            logits = generate_step_fused(model, y[:, None], cache)
-        else:
-            logits = model(y[:, None], cache=cache)
-            mx.eval(logits)
+        logits = model(y[:, None], cache=cache)
+        mx.eval(logits)
         y = mx.argmax(logits[:, -1, :], axis=-1)
         mx.eval(y)
         token_times.append((time.time() - t_tok) * 1000)

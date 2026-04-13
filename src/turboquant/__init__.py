@@ -1,11 +1,10 @@
-__version__ = "0.5.0"
+__version__ = "0.7.0"
 
 from .patch import (
     compress_cache,
     compact_cache,
     restore_cache,
     generate_step,
-    generate_step_fused,
     patch_model_fused,
     chunked_prefill,
     patch_model,
@@ -14,7 +13,7 @@ from .patch import (
     get_num_layers,
     get_model_config,
 )
-from .fused_attention import fused_turboquant_sdpa
+from .fused_attention import tq_sdpa
 from .results import save_experiment, list_experiments, load_experiment
 from .compressor import PolarQuantMLX
 from .cache import TurboQuantCache

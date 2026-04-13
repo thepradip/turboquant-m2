@@ -433,16 +433,6 @@ def generate_step(model, token_id, cache):
     if isinstance(token_id, int):
         token_id = mx.array([[token_id]])
 
-    # window_size stores an uncompressed tail separately. That layout is not
-    # compatible with the incremental append logic below.
-    for c in cache:
-        if getattr(c, '_tq_compacted', False) and getattr(c, '_tq_window_keys', None) is not None:
-            raise ValueError(
-                "generate_step only supports window_size=0. "
-                "Use compress_cache(..., compact=False) with the standard "
-                "generation loop when window_size > 0."
-            )
-
     # Restore FP16 from compressed indices (temporary, for this forward pass)
     any_compacted = any(getattr(c, '_tq_compacted', False) for c in cache)
     if any_compacted:
@@ -497,160 +487,17 @@ def generate_step(model, token_id, cache):
 
 
 # ═══════════════════════════════════════════════════════
-#  Fused generation — no FP16 materialization
+#  Patched model attention (experimental)
 # ═══════════════════════════════════════════════════════
 
-def generate_step_fused(model, token_id, cache):
-    """Generate one token using fused attention on compressed KV cache.
-
-    Unlike generate_step(), this NEVER materializes full FP16 K/V.
-    Attention scores are computed directly on compressed indices via
-    pre-rotated queries and centroid lookups.
-
-    Memory: no FP16 spike. Only transient centroid gather per layer.
-    Speed: eliminates decompress/recompress cycle entirely.
-
-    Args:
-        model: MLX model (must be patched via patch_model_fused first).
-        token_id: mx.array of shape (1, 1).
-        cache: List of KVCache objects (compacted via compress_cache with compact=True).
-
-    Returns:
-        logits: mx.array
-
-    Example::
-        cache = make_turboquant_cache(model, bits=4, fused=True)
-        logits = chunked_prefill(model, ids, cache)
-        patch_model_fused(model)
-
-        y = mx.argmax(logits[:, -1, :], axis=-1)
-        for _ in range(max_tokens):
-            tok = y.item()
-            if tok == tokenizer.eos_token_id:
-                break
-            logits = generate_step_fused(model, y[:, None], cache)
-            y = mx.argmax(logits[:, -1, :], axis=-1)
-            mx.eval(y)
-    """
-    if isinstance(token_id, int):
-        token_id = mx.array([[token_id]])
-
-    # Forward pass — patched attention computes directly on compressed indices
-    logits = model(token_id, cache=cache)
-    mx.eval(logits)
-
-    # After forward, new K/V token was appended to FP16 cache by the model.
-    # Compress it and append to packed indices, then free FP16.
-    for c in cache:
-        if not hasattr(c, '_tq_k_compressor'):
-            continue
-
-        k_mse = c._tq_k_compressor
-        v_mse = c._tq_v_compressor
-        bits = c._tq_bits
-
-        # New token at exact offset position
-        pos = c.offset - 1
-        new_k = c.keys[:, :, pos:pos+1, :].astype(mx.float32)
-        new_v = c.values[:, :, pos:pos+1, :].astype(mx.float32)
-
-        # Quantize new K
-        k_norm = mx.maximum(mx.sqrt(mx.sum(new_k * new_k, axis=-1, keepdims=True)), 1e-8)
-        k_idx = k_mse.quantize(new_k / k_norm)
-        k_packed = pack_indices(k_idx, bits)
-
-        # Quantize new V
-        v_norm = mx.maximum(mx.sqrt(mx.sum(new_v * new_v, axis=-1, keepdims=True)), 1e-8)
-        v_idx = v_mse.quantize(new_v / v_norm)
-        v_packed = pack_indices(v_idx, bits)
-
-        # Append to compressed storage
-        c._tq_k_indices = mx.concatenate([c._tq_k_indices, k_packed], axis=2)
-        c._tq_k_norms = mx.concatenate([c._tq_k_norms, k_norm.astype(mx.float16)], axis=2)
-        c._tq_v_indices = mx.concatenate([c._tq_v_indices, v_packed], axis=2)
-        c._tq_v_norms = mx.concatenate([c._tq_v_norms, v_norm.astype(mx.float16)], axis=2)
-        c._tq_compress_end = c.offset
-
-        mx.eval(c._tq_k_indices, c._tq_k_norms, c._tq_v_indices, c._tq_v_norms)
-
-        # Free FP16
-        c.keys = None
-        c.values = None
-        c._tq_compacted = True
-
-    return logits
-
-
-def patch_model_fused(model):
-    """Patch model's SDPA function to use fused compressed attention.
-
-    Intercepts at the scaled_dot_product_attention level — works with any
-    model architecture (Qwen, Gemma, Llama, etc.) without knowing attribute names.
-
-    After patching, any attention call that receives a cache with compressed
-    data will use fused_turboquant_sdpa instead of standard SDPA.
-
-    Call once after compress_cache(), before generation loop.
-    """
-    import sys
-    from .fused_attention import fused_turboquant_sdpa
-
-    # The replacement SDPA that checks for compressed cache
-    _original_sdpa = None
-
-    def _patched_sdpa(queries, keys, values, cache=None, scale=1.0, mask=None, **kwargs):
-        from .cache import TurboQuantCache
-
-        # Check if cache is a fused TurboQuantCache
-        if cache is not None and isinstance(cache, TurboQuantCache) and cache.fused and cache.k_indices is not None:
-            # In fused mode, keys/values from update_and_fetch are just the new tokens
-            # Fused SDPA reads compressed indices directly from cache
-            return fused_turboquant_sdpa(
-                queries, cache, scale=scale, mask=mask,
-                new_keys=None, new_values=None)
-
-        # Check if cache has compressed data from compress_cache()
-        if cache is not None and hasattr(cache, '_tq_k_indices') and cache._tq_k_indices is not None:
-            n_compressed = cache._tq_compress_end
-            n_total = keys.shape[2]
-            new_k = keys[:, :, n_compressed:, :] if n_total > n_compressed else None
-            new_v = values[:, :, n_compressed:, :] if n_total > n_compressed else None
-            return fused_turboquant_sdpa(
-                queries, cache, scale=scale, mask=mask,
-                new_keys=new_k, new_values=new_v)
-
-        # No compressed data — use original SDPA
-        return _original_sdpa(queries, keys, values, cache=cache, scale=scale, mask=mask, **kwargs)
-
-    # Patch scaled_dot_product_attention in mlx_lm.models.base
-    import mlx_lm.models.base as base_module
-    _original_sdpa = base_module.scaled_dot_product_attention
-    base_module.scaled_dot_product_attention = _patched_sdpa
-
-    # Python's `from X import Y` creates local bindings — patch all loaded model modules
-    for mod_name, mod in list(sys.modules.items()):
-        if mod_name.startswith("mlx_lm.models.") and mod is not None:
-            if hasattr(mod, "scaled_dot_product_attention"):
-                setattr(mod, "scaled_dot_product_attention", _patched_sdpa)
-
-    model._tq_fused_patched = True
-    model._tq_original_sdpa = _original_sdpa
-    return sum(1 for _ in model.layers)
-
-
-# ═══════════════════════════════════════════════════════
-#  Patched model attention (experimental, non-fused)
-# ═══════════════════════════════════════════════════════
-
-def make_turboquant_cache(model, bits: int = 4, value_bits: int = None, fused: bool = False) -> List:
+def make_turboquant_cache(model, bits: int = 4, value_bits: int = None, use_wht: bool = True) -> List:
     """Create TurboQuant caches for all KVCache layers, default for others.
 
     Args:
-        model: MLX model.
         bits: Key quantization bits (2, 3, or 4).
-        value_bits: Value quantization bits (default: same as bits).
-        fused: If True, caches work with fused attention (no FP16 storage).
-               Must call patch_model_fused(model) before generation.
+        value_bits: Value bits (default: same as bits).
+        use_wht: Use Walsh-Hadamard Transform (paper algorithm, O(d log d)).
+                 Default True. Set False for dense rotation (backward compat).
     """
     from mlx_lm.models.cache import make_prompt_cache, KVCache
     from .cache import TurboQuantCache
@@ -662,10 +509,47 @@ def make_turboquant_cache(model, bits: int = 4, value_bits: int = None, fused: b
     caches = []
     for i in range(len(default)):
         if isinstance(default[i], KVCache):
-            caches.append(TurboQuantCache(head_dim, key_bits=bits, value_bits=vb, layer_idx=i, fused=fused))
+            caches.append(TurboQuantCache(head_dim, key_bits=bits, value_bits=vb, layer_idx=i, use_wht=use_wht))
         else:
             caches.append(default[i])
     return caches
+
+
+def patch_model_fused(model):
+    """Patch model SDPA to use fused compressed attention.
+
+    When SDPA receives None keys/values (from TurboQuantCache fused mode),
+    it reads compressed indices directly and computes scores in rotated space.
+
+    Call once before generation.
+    """
+    import sys
+    from .fused_attention import tq_sdpa
+    from .cache import TurboQuantCache
+
+    _original_sdpa = None
+
+    def _patched_sdpa(queries, keys, values, cache=None, scale=1.0, mask=None, **kwargs):
+        from .fused_attention import tq_sdpa
+
+        # Fused path: TurboQuantCache returned None for keys/values
+        if keys is None and cache is not None and isinstance(cache, TurboQuantCache) and cache.fused:
+            return tq_sdpa(queries, cache, scale, mask)
+
+        # Standard path
+        return _original_sdpa(queries, keys, values, cache=cache, scale=scale, mask=mask, **kwargs)
+
+    import mlx_lm.models.base as base_module
+    _original_sdpa = base_module.scaled_dot_product_attention
+    base_module.scaled_dot_product_attention = _patched_sdpa
+
+    for mod_name, mod in list(sys.modules.items()):
+        if mod_name.startswith("mlx_lm.models.") and mod is not None:
+            if hasattr(mod, "scaled_dot_product_attention"):
+                setattr(mod, "scaled_dot_product_attention", _patched_sdpa)
+
+    model._tq_fused_patched = True
+    return sum(1 for _ in model.layers)
 
 
 def patch_model(model, bits: int = 4):

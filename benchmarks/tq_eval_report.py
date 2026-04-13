@@ -13,6 +13,7 @@ FILES = [
     ("Qwen3.5-4B", os.path.join(ROOT, "tq_eval_qwen3.5_4b_mlx_4bit_v2.json"), "#3b82f6"),
     ("Gemma-4 E4B", os.path.join(ROOT, "tq_eval_gemma_4_e4b_it_4bit_v2.json"), "#ef4444"),
     ("Qwen3.5-9B", os.path.join(ROOT, "tq_eval_qwen3.5_9b_4bit_v2.json"), "#22c55e"),
+    ("Qwen3.5-9B OptiQ", os.path.join(ROOT, "tq_eval_qwen3.5_9b_optiq_4bit.json"), "#f97316"),
 ]
 
 CAT_COLORS = {

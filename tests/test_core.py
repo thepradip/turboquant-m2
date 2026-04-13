@@ -233,6 +233,18 @@ class TestCompressCache:
 
 class TestGenerateStep:
     @pytest.fixture
+    def model_and_cache(self):
+        """Load model and create cache with real prefill."""
+        from mlx_lm import load as mlx_load
+        from mlx_lm.models.cache import make_prompt_cache
+        model, tokenizer = mlx_load("mlx-community/Qwen3.5-4B-MLX-4bit")
+        cache = make_prompt_cache(model)
+        ids = mx.array(tokenizer.encode("What is 5+3? Answer with just the number."))
+        logits = model(ids[None], cache=cache)
+        mx.eval(logits)
+        return model, tokenizer, cache, logits
+
+    @pytest.fixture
     def model_and_compressed_cache(self):
         """Load model, prefill, compress with compact=True."""
         from mlx_lm import load as mlx_load
@@ -324,3 +336,4 @@ class TestGenerateStep:
         # Memory after generation should not exceed compacted + reasonable overhead
         overhead_mb = (mem_after - mem_compacted) / 1024**2
         assert overhead_mb < 200, f"Memory grew by {overhead_mb:.0f} MB after generate_step — possible leak"
+

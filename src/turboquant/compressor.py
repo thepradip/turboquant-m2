@@ -40,6 +40,9 @@ def _get_boundaries(head_dim: int, bits: int) -> mx.array:
     return _boundary_cache[(bits, head_dim)]
 
 
+_wht_cache = {}
+
+
 def _get_rotation(head_dim: int, seed: int):
     """Get or build rotation. Cached per (head_dim, seed)."""
     key = (head_dim, seed)
@@ -49,6 +52,15 @@ def _get_rotation(head_dim: int, seed: int):
         mx.eval(r, rt)
         _rotation_cache[key] = (r, rt)
     return _rotation_cache[key]
+
+
+def _get_wht(head_dim: int, seed: int):
+    """Get or build WHT. Cached per (head_dim, seed)."""
+    key = (head_dim, seed)
+    if key not in _wht_cache:
+        from .hadamard import HadamardTransform
+        _wht_cache[key] = HadamardTransform(head_dim, seed=seed)
+    return _wht_cache[key]
 
 
 def _quantize_cumsum(y: mx.array, boundaries: mx.array) -> mx.array:
@@ -76,16 +88,18 @@ class PolarQuantMLX:
     Rotates vectors, quantizes per-coordinate with Lloyd-Max codebook.
 
     Codebook is shared across all instances with same (bits, head_dim).
-    Only rotation matrix is unique per layer (via seed).
+    Rotation is unique per layer (via seed).
 
-    v0.5.0: Uses cumulative boundary comparisons instead of brute-force
-    argmin over all centroids. For 4-bit (15 boundaries), peak memory
-    is O(input_size) instead of O(input_size × 16).
+    Two rotation modes:
+      use_wht=False (default): Dense random orthogonal matrix via QR. O(d^2).
+      use_wht=True: Walsh-Hadamard Transform with random signs. O(d log d).
+        Requires head_dim to be power of 2 (128, 256 — standard for LLMs).
     """
 
-    def __init__(self, head_dim: int, bits: int, seed: int = 42):
+    def __init__(self, head_dim: int, bits: int, seed: int = 42, use_wht: bool = False):
         self.head_dim = head_dim
         self.bits = bits
+        self.use_wht = use_wht
 
         # Shared codebook (cached)
         self.centroids = _get_codebook(head_dim, bits)
@@ -93,18 +107,30 @@ class PolarQuantMLX:
         # Decision boundaries for quantization (cached)
         self.boundaries = _get_boundaries(head_dim, bits)
 
-        # Per-layer rotation (cached per seed)
-        self.rotation, self.rotation_t = _get_rotation(head_dim, seed)
+        if use_wht and (head_dim & (head_dim - 1)) == 0:
+            # Walsh-Hadamard Transform: O(d log d) butterfly
+            self.wht = _get_wht(head_dim, seed)
+            self.rotation = None
+            self.rotation_t = None
+        else:
+            # Dense rotation: O(d^2) matmul
+            self.wht = None
+            self.rotation, self.rotation_t = _get_rotation(head_dim, seed)
 
     def quantize(self, x: mx.array):
         """Quantize to indices via boundary comparisons. Input: (..., head_dim). Returns uint8."""
         x = x.astype(mx.float32)
-        y = x @ self.rotation_t
+        if self.wht is not None:
+            y = self.wht.forward(x)
+        else:
+            y = x @ self.rotation_t
         return _quantize_cumsum(y, self.boundaries)
 
     def dequantize(self, indices: mx.array) -> mx.array:
         """Dequantize indices back to vectors. Returns float32."""
         y_hat = self.centroids[indices.astype(mx.uint32)]
+        if self.wht is not None:
+            return self.wht.inverse(y_hat)
         return y_hat @ self.rotation
 
     def quantize_with_residual(self, x: mx.array):
