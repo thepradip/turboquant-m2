@@ -107,6 +107,13 @@ def chunked_prefill(
         logits = model(chunk[None], cache=cache)
         mx.eval(logits)
 
+        # Eval cache buffers to free computation graph intermediates
+        for c in cache:
+            if hasattr(c, '_k_buf') and c._k_buf is not None:
+                mx.eval(c._k_buf, c._v_buf)
+            if hasattr(c, 'k_indices') and c.k_indices is not None:
+                mx.eval(c.k_indices, c.k_norms)
+
     return logits
 
 
