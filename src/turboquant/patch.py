@@ -497,14 +497,14 @@ def generate_step(model, token_id, cache):
 #  Patched model attention (experimental)
 # ═══════════════════════════════════════════════════════
 
-def make_turboquant_cache(model, bits: int = 4, value_bits: int = None, use_wht: bool = True) -> List:
+def make_turboquant_cache(model, bits: int = 4, value_bits: int = None, use_wht: bool = False) -> List:
     """Create TurboQuant caches for all KVCache layers, default for others.
 
     Args:
         bits: Key quantization bits (2, 3, or 4).
         value_bits: Value bits (default: same as bits).
-        use_wht: Use Walsh-Hadamard Transform (paper algorithm, O(d log d)).
-                 Default True. Set False for dense rotation (backward compat).
+        use_wht: Use Walsh-Hadamard Transform (O(d log d)).
+                 Default False — dense rotation is faster on MLX (optimized matmul).
     """
     from mlx_lm.models.cache import make_prompt_cache, KVCache
     from .cache import TurboQuantCache
